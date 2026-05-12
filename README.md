@@ -68,7 +68,7 @@ cargo build --release
 ## Test
 
 ```bash
-cargo test --test test_compiler
+cargo test
 ```
 
 ## Run
