@@ -74,6 +74,14 @@ fn test_modal_where_reasonable_fails() {
     ));
 }
 
+#[test]
+fn test_modal_word_requires_boundary() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("The mayor must be logged by SYSTEM.");
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+}
+
 // =============================================================================
 // Action Verb Validation Tests
 // =============================================================================
@@ -85,6 +93,18 @@ fn test_clause_without_recognized_action_verb_fails() {
     // Note: "secure" is not in the list, and there's no log/audit/record/etc.
     let policy = "The system is secure by SYSTEM.";
     let result = compiler.compile(policy);
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        &result.errors[0],
+        CompilationError::MissingActionVerb { .. }
+    ));
+}
+
+#[test]
+fn test_action_verb_requires_boundary() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Mustard policy by SYSTEM.");
 
     assert_eq!(result.verdict, CompilationStatus::Fail);
     assert!(matches!(
@@ -282,6 +302,19 @@ fn test_cost_mention_with_explicit_unit_passes() {
     assert_eq!(result.icae_constraints.len(), 1);
 }
 
+#[test]
+fn test_measurement_unit_requires_boundary() {
+    let compiler = PolicyCompiler::new();
+    let policy = "Cost of crop cannot exceed 100 USDA by SYSTEM.";
+    let result = compiler.compile(policy);
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        &result.errors[0],
+        CompilationError::MissingMeasurementUnit { .. }
+    ));
+}
+
 // =============================================================================
 // Traceability Tests
 // =============================================================================
@@ -440,6 +473,16 @@ fn test_very_long_clause_truncation() {
     assert_eq!(result.verdict, CompilationStatus::Pass);
     // Descriptions should be truncated, not cause overflow
     assert!(result.dio_invariants[0].description.len() < 200);
+}
+
+#[test]
+fn test_long_unicode_clause_truncation_does_not_panic() {
+    let compiler = PolicyCompiler::new();
+    let long_text = "\u{6f22}".repeat(100);
+    let policy = format!("{} must be logged by SYSTEM.", long_text);
+    let result = compiler.compile(&policy);
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
 }
 
 #[test]

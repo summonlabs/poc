@@ -156,18 +156,14 @@ impl Principal {
 
     /// Attempts to parse a principal from text using word boundary detection.
     pub fn from_clause(clause: &str) -> Option<Self> {
-        let clause_upper = clause.to_uppercase();
-        let tokens: Vec<&str> = clause_upper
-            .split_whitespace()
-            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
-            .collect();
+        let tokens = normalized_tokens(clause);
 
         // Check tokens for exact matches (word boundary detection)
         for token in &tokens {
-            match *token {
-                "SYSTEM" => return Some(Principal::System),
-                "USER" => return Some(Principal::User),
-                "SERVICE" => return Some(Principal::Service),
+            match token.as_str() {
+                "system" => return Some(Principal::System),
+                "user" => return Some(Principal::User),
+                "service" => return Some(Principal::Service),
                 _ => continue,
             }
         }
@@ -209,8 +205,6 @@ impl MeasurementUnit {
 
     /// Attempts to parse a measurement unit from text.
     pub fn from_clause(clause: &str) -> Option<Self> {
-        let clause_lower = clause.to_lowercase();
-
         // Check for currency symbols first - these are NOT valid units
         if ["$", "€", "£", "¥", "â‚¬", "Â£", "Â¥"]
             .iter()
@@ -219,26 +213,28 @@ impl MeasurementUnit {
             return None;
         }
 
+        let tokens = normalized_tokens(clause);
+
         // Check for explicit unit names (case-insensitive)
-        if clause_lower.contains("usd") {
+        if tokens.iter().any(|token| token == "usd") {
             return Some(MeasurementUnit::Usd);
         }
-        if clause_lower.contains("eur") {
+        if tokens.iter().any(|token| token == "eur") {
             return Some(MeasurementUnit::Eur);
         }
-        if clause_lower.contains("gbp") {
+        if tokens.iter().any(|token| token == "gbp") {
             return Some(MeasurementUnit::Gbp);
         }
-        if clause_lower.contains("tokens") {
+        if tokens.iter().any(|token| token == "tokens") {
             return Some(MeasurementUnit::Tokens);
         }
-        if clause_lower.contains("bytes") {
+        if tokens.iter().any(|token| token == "bytes") {
             return Some(MeasurementUnit::Bytes);
         }
-        if clause_lower.contains("requests") {
+        if tokens.iter().any(|token| token == "requests") {
             return Some(MeasurementUnit::Requests);
         }
-        if clause_lower.contains("hours") {
+        if tokens.iter().any(|token| token == "hours") {
             return Some(MeasurementUnit::Hours);
         }
 
@@ -266,7 +262,8 @@ const MODAL_WORDS: &[&str] = &[
 /// Action verbs required for valid policy clauses.
 const ACTION_VERBS: &[&str] = &[
     "must", "shall", "require", "log", "audit", "record", "deny", "allow", "enforce", "track",
-    "exceed",
+    "exceed", "required", "logged", "audited", "recorded", "denied", "allowed", "enforced",
+    "tracked",
 ];
 
 /// Cost indicator terms that trigger ICAE constraint validation.
@@ -479,9 +476,8 @@ impl PolicyCompiler {
     ) -> Result<IntentNormalization, CompilationError> {
         // Check for modal/discretionary language
         for (i, clause) in clauses.iter().enumerate() {
-            let clause_lower = clause.to_lowercase();
             for modal_word in MODAL_WORDS {
-                if clause_lower.contains(modal_word) {
+                if contains_policy_term(clause, modal_word) {
                     return Err(CompilationError::ModalLanguageDetected {
                         clause_index: i,
                         clause: clause.clone(),
@@ -493,8 +489,9 @@ impl PolicyCompiler {
 
         // Check for atomic clauses
         for (i, clause) in clauses.iter().enumerate() {
-            let clause_lower = clause.to_lowercase();
-            let has_action = ACTION_VERBS.iter().any(|verb| clause_lower.contains(verb));
+            let has_action = ACTION_VERBS
+                .iter()
+                .any(|verb| contains_policy_term(clause, verb));
             if !has_action {
                 return Err(CompilationError::MissingActionVerb {
                     clause_index: i,
@@ -623,8 +620,9 @@ impl PolicyCompiler {
         let mut errors = Vec::new();
 
         for (i, clause) in clauses.iter().enumerate() {
-            let clause_lower = clause.to_lowercase();
-            let has_cost_mention = COST_INDICATORS.iter().any(|ind| clause_lower.contains(ind));
+            let has_cost_mention = COST_INDICATORS
+                .iter()
+                .any(|indicator| contains_policy_term(clause, indicator));
 
             if !has_cost_mention {
                 continue;
@@ -731,10 +729,11 @@ impl PolicyCompiler {
 
     /// Truncates clause text to specified length with ellipsis.
     fn truncate_clause(clause: &str, max_len: usize) -> String {
-        if clause.len() <= max_len {
+        if clause.chars().count() <= max_len {
             clause.to_string()
         } else {
-            format!("{}...", &clause[..max_len])
+            let truncated: String = clause.chars().take(max_len).collect();
+            format!("{}...", truncated)
         }
     }
 
@@ -764,6 +763,25 @@ impl PolicyCompiler {
             failures,
         }
     }
+}
+
+fn normalized_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn contains_policy_term(text: &str, term: &str) -> bool {
+    let tokens = normalized_tokens(text);
+    let term_tokens = normalized_tokens(term);
+    if term_tokens.is_empty() || term_tokens.len() > tokens.len() {
+        return false;
+    }
+
+    tokens
+        .windows(term_tokens.len())
+        .any(|window| window == term_tokens.as_slice())
 }
 
 #[cfg(test)]
