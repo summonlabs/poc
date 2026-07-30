@@ -45,13 +45,30 @@ pub enum CompilationError {
         clause_index: usize,
         clause: String,
     },
+    AmbiguousPrincipal {
+        clause_index: usize,
+        clause: String,
+    },
     MissingMeasurementUnit {
+        clause_index: usize,
+        clause: String,
+    },
+    AmbiguousMeasurementUnit {
         clause_index: usize,
         clause: String,
     },
     MissingCostSubject {
         clause_index: usize,
         clause: String,
+    },
+    AmbiguousCostSubject {
+        clause_index: usize,
+        clause: String,
+    },
+    InvalidCeiling {
+        clause_index: usize,
+        clause: String,
+        value: String,
     },
     InternalError {
         context: String,
@@ -107,6 +124,16 @@ impl fmt::Display for CompilationError {
                     clause_index, clause
                 )
             }
+            CompilationError::AmbiguousPrincipal {
+                clause_index,
+                clause,
+            } => {
+                write!(
+                    f,
+                    "Clause {} contains ambiguous authority principals: '{}'",
+                    clause_index, clause
+                )
+            }
             CompilationError::MissingMeasurementUnit {
                 clause_index,
                 clause,
@@ -114,6 +141,16 @@ impl fmt::Display for CompilationError {
                 write!(
                     f,
                     "Clause {} mentions cost but no explicit measurement unit: '{}'",
+                    clause_index, clause
+                )
+            }
+            CompilationError::AmbiguousMeasurementUnit {
+                clause_index,
+                clause,
+            } => {
+                write!(
+                    f,
+                    "Clause {} contains multiple measurement units: '{}'",
                     clause_index, clause
                 )
             }
@@ -125,6 +162,27 @@ impl fmt::Display for CompilationError {
                     f,
                     "Clause {} mentions cost but no attribution subject: '{}'",
                     clause_index, clause
+                )
+            }
+            CompilationError::AmbiguousCostSubject {
+                clause_index,
+                clause,
+            } => {
+                write!(
+                    f,
+                    "Clause {} contains multiple cost subjects or indicators: '{}'",
+                    clause_index, clause
+                )
+            }
+            CompilationError::InvalidCeiling {
+                clause_index,
+                clause,
+                value,
+            } => {
+                write!(
+                    f,
+                    "Clause {} contains invalid cost ceiling '{}': '{}'",
+                    clause_index, value, clause
                 )
             }
             CompilationError::InternalError { context } => {
@@ -144,6 +202,13 @@ pub enum Principal {
     Service,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrincipalResolution {
+    Unique(Principal),
+    Missing,
+    Ambiguous,
+}
+
 impl Principal {
     /// Returns the canonical string representation.
     pub fn as_str(&self) -> &'static str {
@@ -156,18 +221,10 @@ impl Principal {
 
     /// Attempts to parse a principal from text using word boundary detection.
     pub fn from_clause(clause: &str) -> Option<Self> {
-        let tokens = normalized_tokens(clause);
-
-        // Check tokens for exact matches (word boundary detection)
-        for token in &tokens {
-            match token.as_str() {
-                "system" => return Some(Principal::System),
-                "user" => return Some(Principal::User),
-                "service" => return Some(Principal::Service),
-                _ => continue,
-            }
+        match resolve_principal(clause) {
+            PrincipalResolution::Unique(principal) => Some(principal),
+            PrincipalResolution::Missing | PrincipalResolution::Ambiguous => None,
         }
-        None
     }
 }
 
@@ -205,40 +262,12 @@ impl MeasurementUnit {
 
     /// Attempts to parse a measurement unit from text.
     pub fn from_clause(clause: &str) -> Option<Self> {
-        // Check for currency symbols first - these are NOT valid units
-        if ["$", "€", "£", "¥", "â‚¬", "Â£", "Â¥"]
-            .iter()
-            .any(|s| clause.contains(s))
-        {
-            return None;
+        let units = measurement_units_from_clause(clause);
+        if units.len() == 1 {
+            units.first().copied()
+        } else {
+            None
         }
-
-        let tokens = normalized_tokens(clause);
-
-        // Check for explicit unit names (case-insensitive)
-        if tokens.iter().any(|token| token == "usd") {
-            return Some(MeasurementUnit::Usd);
-        }
-        if tokens.iter().any(|token| token == "eur") {
-            return Some(MeasurementUnit::Eur);
-        }
-        if tokens.iter().any(|token| token == "gbp") {
-            return Some(MeasurementUnit::Gbp);
-        }
-        if tokens.iter().any(|token| token == "tokens") {
-            return Some(MeasurementUnit::Tokens);
-        }
-        if tokens.iter().any(|token| token == "bytes") {
-            return Some(MeasurementUnit::Bytes);
-        }
-        if tokens.iter().any(|token| token == "requests") {
-            return Some(MeasurementUnit::Requests);
-        }
-        if tokens.iter().any(|token| token == "hours") {
-            return Some(MeasurementUnit::Hours);
-        }
-
-        None
     }
 }
 
@@ -252,6 +281,7 @@ impl fmt::Display for MeasurementUnit {
 const MODAL_WORDS: &[&str] = &[
     "should",
     "may",
+    "can",
     "where reasonable",
     "as appropriate",
     "could",
@@ -261,21 +291,66 @@ const MODAL_WORDS: &[&str] = &[
 
 /// Action verbs required for valid policy clauses.
 const ACTION_VERBS: &[&str] = &[
-    "must", "shall", "require", "log", "audit", "record", "deny", "allow", "enforce", "track",
-    "exceed", "required", "logged", "audited", "recorded", "denied", "allowed", "enforced",
+    "require",
+    "log",
+    "audit",
+    "record",
+    "deny",
+    "allow",
+    "enforce",
+    "track",
+    "exceed",
+    "delegate",
+    "revoke",
+    "approve",
+    "required",
+    "logged",
+    "audited",
+    "recorded",
+    "denied",
+    "allowed",
+    "enforced",
     "tracked",
+    "delegated",
+    "revoked",
+    "approved",
+    "limited",
+    "capped",
 ];
+
+const ACTION_ORDERING_WORDS: &[&str] = &["then", "before", "after"];
 
 /// Cost indicator terms that trigger ICAE constraint validation.
 const COST_INDICATORS: &[&str] = &[
     "cost",
+    "costs",
     "spend",
+    "spends",
     "usage",
+    "usages",
     "quota",
+    "quotas",
     "resource consumption",
     "externality",
     "budget",
+    "budgets",
     "expense",
+    "expenses",
+    "fee",
+    "fees",
+    "price",
+    "prices",
+    "charge",
+    "charges",
+    "externalities",
+    "limit",
+    "limits",
+    "cap",
+    "caps",
+    "ceiling",
+    "ceilings",
+    "maximum",
+    "maximums",
 ];
 
 #[derive(Debug, Clone)]
@@ -460,12 +535,36 @@ impl PolicyCompiler {
     }
 
     /// Parses policy text into individual clauses.
-    /// Uses period as delimiter with whitespace normalization.
+    /// Uses non-decimal periods as delimiters with whitespace normalization.
     fn parse_clauses(text: &str) -> Vec<String> {
-        text.split_terminator('.')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        let characters: Vec<char> = text.chars().collect();
+        let mut clauses = Vec::new();
+        let mut current = String::new();
+
+        for (index, character) in characters.iter().enumerate() {
+            let is_decimal_point = *character == '.'
+                && index > 0
+                && index + 1 < characters.len()
+                && characters[index - 1].is_ascii_digit()
+                && characters[index + 1].is_ascii_digit();
+
+            if *character == '.' && !is_decimal_point {
+                let clause = current.trim();
+                if !clause.is_empty() {
+                    clauses.push(clause.to_string());
+                }
+                current.clear();
+            } else {
+                current.push(*character);
+            }
+        }
+
+        let clause = current.trim();
+        if !clause.is_empty() {
+            clauses.push(clause.to_string());
+        }
+
+        clauses
     }
 
     /// Normalizes intent by validating clause structure and extracting assumptions/exclusions.
@@ -487,12 +586,10 @@ impl PolicyCompiler {
             }
         }
 
-        // Check for atomic clauses
+        // Require at least one substantive action. Deontic auxiliaries such as
+        // "must" and "shall" do not describe an enforceable action by themselves.
         for (i, clause) in clauses.iter().enumerate() {
-            let has_action = ACTION_VERBS
-                .iter()
-                .any(|verb| contains_policy_term(clause, verb));
-            if !has_action {
+            if action_positions(clause).is_empty() {
                 return Err(CompilationError::MissingActionVerb {
                     clause_index: i,
                     clause: clause.clone(),
@@ -500,19 +597,23 @@ impl PolicyCompiler {
             }
         }
 
-        // Check for multiple actions without ordering
+        // Every consecutive pair of substantive actions must have an ordering
+        // token between the two actions. An ordering word elsewhere in the
+        // clause cannot make an unordered pair deterministic.
         for (i, clause) in clauses.iter().enumerate() {
-            let clause_lower = clause.to_lowercase();
-            // Check for conjunctions that indicate multiple unordered actions
-            if (clause_lower.contains(" and ") || clause_lower.contains(" or ")) 
-                && !clause_lower.contains("then")  // Allow ordered sequences
-                && !clause_lower.contains("before") 
-                && !clause_lower.contains("after")
-            {
-                return Err(CompilationError::AmbiguousMultiAction {
-                    clause_index: i,
-                    clause: clause.clone(),
-                });
+            let tokens = normalized_tokens(clause);
+            let positions = action_positions(clause);
+            for pair in positions.windows(2) {
+                let between = &tokens[pair[0] + 1..pair[1]];
+                if !between
+                    .iter()
+                    .any(|token| ACTION_ORDERING_WORDS.contains(&token.as_str()))
+                {
+                    return Err(CompilationError::AmbiguousMultiAction {
+                        clause_index: i,
+                        clause: clause.clone(),
+                    });
+                }
             }
         }
 
@@ -572,20 +673,27 @@ impl PolicyCompiler {
         let mut errors = Vec::new();
 
         for (i, clause) in clauses.iter().enumerate() {
-            match Principal::from_clause(clause) {
-                Some(principal) => {
+            match resolve_principal(clause) {
+                PrincipalResolution::Unique(principal) => {
                     let authority_id = format!("zt_auth_{}", i);
-                    let scope = format!("scope_{}", i);
-                    let truncated_clause = Self::truncate_clause(clause, 30);
+                    let scope = clause.clone();
 
-                    let delegation_rules = vec![format!(
-                        "Delegation requires explicit {} approval for: {}",
-                        principal, truncated_clause
-                    )];
-                    let revocation_triggers = vec![format!(
-                        "Revoke on policy change affecting: {}",
-                        truncated_clause
-                    )];
+                    let delegation_rules = if ["delegate", "delegated", "delegation"]
+                        .iter()
+                        .any(|term| contains_policy_term(clause, term))
+                    {
+                        vec![clause.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    let revocation_triggers = if ["revoke", "revoked", "revocation"]
+                        .iter()
+                        .any(|term| contains_policy_term(clause, term))
+                    {
+                        vec![clause.clone()]
+                    } else {
+                        Vec::new()
+                    };
 
                     let authority = ZTAuthority {
                         id: authority_id,
@@ -600,8 +708,14 @@ impl PolicyCompiler {
                         list.push(authority);
                     }
                 }
-                None => {
+                PrincipalResolution::Missing => {
                     errors.push(CompilationError::MissingPrincipal {
+                        clause_index: i,
+                        clause: clause.clone(),
+                    });
+                }
+                PrincipalResolution::Ambiguous => {
+                    errors.push(CompilationError::AmbiguousPrincipal {
                         clause_index: i,
                         clause: clause.clone(),
                     });
@@ -628,10 +742,29 @@ impl PolicyCompiler {
                 continue;
             }
 
+            // Rate windows cannot be represented truthfully by the current
+            // public artifact. Fail closed before subject/unit extraction.
+            if let Some(window) = extract_rate_window(clause) {
+                errors.push(CompilationError::IntentNormalizationFailed {
+                    reason: format!(
+                        "Clause {} contains unsupported rate window '{}': '{}'",
+                        i, window, clause
+                    ),
+                });
+                continue;
+            }
+
             let subject = match Self::extract_subject(clause) {
-                Some(s) => s,
-                None => {
+                Ok(Some(subject)) => subject,
+                Ok(None) => {
                     errors.push(CompilationError::MissingCostSubject {
+                        clause_index: i,
+                        clause: clause.clone(),
+                    });
+                    continue;
+                }
+                Err(()) => {
+                    errors.push(CompilationError::AmbiguousCostSubject {
                         clause_index: i,
                         clause: clause.clone(),
                     });
@@ -639,10 +772,30 @@ impl PolicyCompiler {
                 }
             };
 
-            let measurement_unit = match MeasurementUnit::from_clause(clause) {
-                Some(u) => u,
-                None => {
+            let ceiling = match Self::extract_ceiling(clause) {
+                Ok(value) => value,
+                Err(value) => {
+                    errors.push(CompilationError::InvalidCeiling {
+                        clause_index: i,
+                        clause: clause.clone(),
+                        value,
+                    });
+                    continue;
+                }
+            };
+
+            let measurement_units = measurement_units_from_clause(clause);
+            let measurement_unit = match measurement_units.as_slice() {
+                [unit] => *unit,
+                [] => {
                     errors.push(CompilationError::MissingMeasurementUnit {
+                        clause_index: i,
+                        clause: clause.clone(),
+                    });
+                    continue;
+                }
+                _ => {
+                    errors.push(CompilationError::AmbiguousMeasurementUnit {
                         clause_index: i,
                         clause: clause.clone(),
                     });
@@ -651,15 +804,21 @@ impl PolicyCompiler {
             };
 
             let constraint_id = format!("icae_{}", i);
-            let truncated_clause = Self::truncate_clause(clause, 30);
-            let externalities = vec![format!("External cost from: {}", truncated_clause)];
+            let externalities = if contains_policy_term(clause, "externality")
+                || contains_policy_term(clause, "externalities")
+                || contains_policy_term(clause, "external cost")
+            {
+                vec![clause.clone()]
+            } else {
+                Vec::new()
+            };
 
             let constraint = ICAECostConstraint {
                 id: constraint_id,
                 subject,
                 measurement_unit,
                 clause_index: i,
-                ceiling: None,
+                ceiling,
                 externalities,
             };
 
@@ -672,21 +831,103 @@ impl PolicyCompiler {
     }
 
     /// Extracts cost attribution subject from clause.
-    fn extract_subject(clause: &str) -> Option<String> {
-        let stop_words: &[&str] = &[
-            "cost", "spend", "usage", "quota", "the", "a", "an", "of", "for", "per", "must",
-            "shall", "cannot", "exceed", "all", "no", "be", "by", "system", "user", "service",
-        ];
+    fn extract_subject(clause: &str) -> Result<Option<String>, ()> {
+        let tokens = normalized_tokens(clause);
+        let spans = cost_indicator_spans(&tokens);
+        let mut subjects = Vec::new();
+        let mut indicators = Vec::new();
 
-        for word in clause.split_whitespace() {
-            let clean_word = word.trim_matches(|c: char| !c.is_alphanumeric());
-            let lower = clean_word.to_lowercase();
+        for (start, end) in spans {
+            let indicator = tokens[start..end].join(" ");
+            if !indicators.contains(&indicator) {
+                indicators.push(indicator);
+            }
 
-            if clean_word.len() > 3 && !stop_words.contains(&lower.as_str()) {
-                return Some(clean_word.to_string());
+            let subject = if end < tokens.len() && (tokens[end] == "of" || tokens[end] == "for") {
+                collect_subject_forward(&tokens, end + 1)
+                    .or_else(|| collect_subject_backward(&tokens, start))
+            } else {
+                collect_subject_backward(&tokens, start)
+            };
+            if let Some(subject) = subject {
+                if !subjects.contains(&subject) {
+                    subjects.push(subject);
+                }
             }
         }
-        None
+
+        if indicators.len() > 1 || subjects.len() > 1 {
+            Err(())
+        } else {
+            Ok(subjects.into_iter().next())
+        }
+    }
+
+    /// Extracts an explicit upper bound. Positive `must exceed` language is a
+    /// floor, not a ceiling, and is rejected rather than silently mistranslated.
+    fn extract_ceiling(clause: &str) -> Result<Option<f64>, String> {
+        let words: Vec<&str> = clause.split_whitespace().collect();
+        let normalized_words: Vec<String> = words
+            .iter()
+            .map(|word| {
+                word.trim_matches(|character: char| !character.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .collect();
+
+        for (index, normalized) in normalized_words.iter().enumerate() {
+            if normalized == "exceed" {
+                let negative = normalized_words[index.saturating_sub(3)..index]
+                    .iter()
+                    .any(|word| word == "cannot" || word == "not");
+                if !negative {
+                    return Err("unsupported floor: exceed".to_string());
+                }
+                return Self::parse_ceiling_value(words.get(index + 1).copied());
+            }
+
+            let relation_offset = match normalized.as_str() {
+                "limit" | "limits" | "cap" | "caps" | "ceiling" | "ceilings" | "maximum"
+                | "maximums" | "budget" | "budgets" | "quota" | "quotas" => Some(1),
+                "limited" | "capped" => Some(1),
+                _ => None,
+            };
+            if let Some(offset) = relation_offset {
+                let relation_index = index + offset;
+                let relation = normalized_words.get(relation_index).map(String::as_str);
+                let value_index = if [Some("of"), Some("at"), Some("to")].contains(&relation) {
+                    relation_index + 1
+                } else {
+                    relation_index
+                };
+                return Self::parse_ceiling_value(words.get(value_index).copied());
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn parse_ceiling_value(raw_value: Option<&str>) -> Result<Option<f64>, String> {
+        let raw_value = raw_value.ok_or_else(|| "<missing>".to_string())?;
+        let numeric_text = raw_value
+            .trim_matches(|character: char| {
+                !(character.is_ascii_digit()
+                    || character == '.'
+                    || character == '+'
+                    || character == '-'
+                    || character == 'e'
+                    || character == 'E'
+                    || character == ',')
+            })
+            .replace(',', "");
+
+        let value = numeric_text
+            .parse::<f64>()
+            .map_err(|_| raw_value.to_string())?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(raw_value.to_string());
+        }
+        Ok(Some(value))
     }
 
     /// Builds traceability map linking clauses to artifacts.
@@ -763,6 +1004,376 @@ impl PolicyCompiler {
             failures,
         }
     }
+}
+
+fn resolve_principal(clause: &str) -> PrincipalResolution {
+    let tokens = normalized_tokens(clause);
+    let actions = action_positions(clause);
+    let final_action = actions.last().copied();
+    let mut explicit = Vec::new();
+
+    for index in 0..tokens.len() {
+        if tokens[index] != "by"
+            || final_action
+                .map(|action_index| index <= action_index)
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let mut candidate_index = index + 1;
+        if tokens.get(candidate_index).map(String::as_str) == Some("the") {
+            candidate_index += 1;
+        }
+        if let Some(principal) = tokens
+            .get(candidate_index)
+            .and_then(|token| principal_token(token))
+        {
+            push_unique(&mut explicit, principal);
+            candidate_index += 1;
+
+            // Recognize coordinated principals following the same `by`, while
+            // stopping before unrelated objects such as `for USER`.
+            loop {
+                match tokens.get(candidate_index).map(String::as_str) {
+                    Some("and") | Some("or") => candidate_index += 1,
+                    _ => {}
+                }
+
+                match tokens
+                    .get(candidate_index)
+                    .and_then(|token| principal_token(token))
+                {
+                    Some(principal) => {
+                        push_unique(&mut explicit, principal);
+                        candidate_index += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // A clause-leading principal is active only when immediately followed by
+    // a deontic auxiliary or substantive action. A noun phrase such as
+    // `USER credentials` is an object mention, not an authority declaration.
+    let leading = tokens.first().and_then(|token| principal_token(token));
+    let active_leading = leading.filter(|_| {
+        tokens.get(1).map(String::as_str).is_some_and(|token| {
+            ["must", "shall", "cannot"].contains(&token) || ACTION_VERBS.contains(&token)
+        })
+    });
+    if let Some(principal) = active_leading {
+        push_unique(&mut explicit, principal);
+    }
+
+    match explicit.as_slice() {
+        [principal] => PrincipalResolution::Unique(*principal),
+        [] => PrincipalResolution::Missing,
+        _ => PrincipalResolution::Ambiguous,
+    }
+}
+
+fn principal_token(token: &str) -> Option<Principal> {
+    match token {
+        "system" => Some(Principal::System),
+        "user" => Some(Principal::User),
+        "service" => Some(Principal::Service),
+        _ => None,
+    }
+}
+
+fn push_unique<T: Copy + PartialEq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn measurement_units_from_clause(clause: &str) -> Vec<MeasurementUnit> {
+    // Currency symbols are intentionally not accepted as explicit units.
+    if ["$", "€", "£", "¥", "â‚¬", "Â£", "Â¥"]
+        .iter()
+        .any(|symbol| clause.contains(symbol))
+    {
+        return Vec::new();
+    }
+
+    let mut units = Vec::new();
+    for token in normalized_tokens(clause) {
+        let unit = match token.as_str() {
+            "usd" => Some(MeasurementUnit::Usd),
+            "eur" => Some(MeasurementUnit::Eur),
+            "gbp" => Some(MeasurementUnit::Gbp),
+            "tokens" => Some(MeasurementUnit::Tokens),
+            "bytes" => Some(MeasurementUnit::Bytes),
+            "requests" => Some(MeasurementUnit::Requests),
+            "hours" => Some(MeasurementUnit::Hours),
+            _ => None,
+        };
+        if let Some(unit) = unit {
+            push_unique(&mut units, unit);
+        }
+    }
+    units
+}
+
+fn action_positions(clause: &str) -> Vec<usize> {
+    normalized_tokens(clause)
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| {
+            if ACTION_VERBS.contains(&token.as_str())
+                && !(index == 0 && is_past_participle_action(token))
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_past_participle_action(token: &str) -> bool {
+    [
+        "required",
+        "logged",
+        "audited",
+        "recorded",
+        "denied",
+        "allowed",
+        "enforced",
+        "tracked",
+        "delegated",
+        "revoked",
+        "approved",
+        "limited",
+        "capped",
+    ]
+    .contains(&token)
+}
+
+fn extract_rate_window(clause: &str) -> Option<String> {
+    let tokens = normalized_tokens(clause);
+    for token in &tokens {
+        if [
+            "monthly",
+            "daily",
+            "weekly",
+            "yearly",
+            "hourly",
+            "annually",
+            "quarterly",
+        ]
+        .contains(&token.as_str())
+        {
+            return Some(token.clone());
+        }
+    }
+    for pair in tokens.windows(2) {
+        if pair[0] == "per" {
+            return Some(format!("per {}", pair[1]));
+        }
+        if ["each", "every"].contains(&pair[0].as_str())
+            && [
+                "hour", "hours", "day", "days", "week", "weeks", "month", "months", "year",
+                "years", "quarter", "quarters",
+            ]
+            .contains(&pair[1].as_str())
+        {
+            return Some(format!("{} {}", pair[0], pair[1]));
+        }
+    }
+    None
+}
+
+fn cost_indicator_spans(tokens: &[String]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if index + 1 < tokens.len()
+            && ((tokens[index] == "resource" && tokens[index + 1] == "consumption")
+                || (tokens[index] == "external"
+                    && ["cost", "costs"].contains(&tokens[index + 1].as_str()))
+                || (["cost", "costs"].contains(&tokens[index].as_str())
+                    && [
+                        "limit", "limits", "cap", "caps", "ceiling", "ceilings", "maximum",
+                        "maximums",
+                    ]
+                    .contains(&tokens[index + 1].as_str())))
+        {
+            spans.push((index, index + 2));
+            index += 2;
+            continue;
+        }
+
+        if [
+            "cost",
+            "costs",
+            "spend",
+            "spends",
+            "usage",
+            "usages",
+            "quota",
+            "quotas",
+            "externality",
+            "externalities",
+            "budget",
+            "budgets",
+            "expense",
+            "expenses",
+            "fee",
+            "fees",
+            "price",
+            "prices",
+            "charge",
+            "charges",
+            "limit",
+            "limits",
+            "cap",
+            "caps",
+            "ceiling",
+            "ceilings",
+            "maximum",
+            "maximums",
+        ]
+        .contains(&tokens[index].as_str())
+        {
+            spans.push((index, index + 1));
+        }
+        index += 1;
+    }
+    spans
+}
+
+fn collect_subject_forward(tokens: &[String], start: usize) -> Option<String> {
+    let mut subject = Vec::new();
+    for token in tokens.iter().skip(start) {
+        if is_skippable_subject_modifier(token) {
+            continue;
+        }
+        if !is_valid_cost_subject(token) {
+            break;
+        }
+        subject.push(token.clone());
+    }
+    if subject.is_empty() {
+        None
+    } else {
+        Some(subject.join(" "))
+    }
+}
+
+fn collect_subject_backward(tokens: &[String], end: usize) -> Option<String> {
+    let mut subject = Vec::new();
+    let mut index = end;
+    while index > 0 {
+        index -= 1;
+        let token = &tokens[index];
+        if is_skippable_subject_modifier(token) {
+            continue;
+        }
+        if !is_valid_cost_subject(token) {
+            break;
+        }
+        subject.push(token.clone());
+    }
+    subject.reverse();
+    if subject.is_empty() {
+        None
+    } else {
+        Some(subject.join(" "))
+    }
+}
+
+fn is_skippable_subject_modifier(token: &str) -> bool {
+    ["the", "a", "an", "each", "every"].contains(&token)
+}
+
+fn is_valid_cost_subject(token: &str) -> bool {
+    if !token.chars().any(|character| character.is_alphabetic()) {
+        return false;
+    }
+    if ACTION_VERBS.contains(&token) {
+        return false;
+    }
+
+    ![
+        "cost",
+        "costs",
+        "spend",
+        "spends",
+        "usage",
+        "usages",
+        "quota",
+        "quotas",
+        "resource",
+        "consumption",
+        "external",
+        "externality",
+        "externalities",
+        "budget",
+        "budgets",
+        "expense",
+        "expenses",
+        "fee",
+        "fees",
+        "price",
+        "prices",
+        "charge",
+        "charges",
+        "limit",
+        "limits",
+        "cap",
+        "caps",
+        "ceiling",
+        "ceilings",
+        "maximum",
+        "maximums",
+        "the",
+        "a",
+        "an",
+        "of",
+        "for",
+        "per",
+        "in",
+        "to",
+        "from",
+        "by",
+        "all",
+        "no",
+        "not",
+        "be",
+        "must",
+        "shall",
+        "cannot",
+        "then",
+        "before",
+        "after",
+        "system",
+        "user",
+        "service",
+        "usd",
+        "eur",
+        "gbp",
+        "tokens",
+        "bytes",
+        "requests",
+        "hours",
+        "tracking",
+        "auditing",
+        "recording",
+        "enforcing",
+        "charging",
+        "pricing",
+        "monthly",
+        "daily",
+        "weekly",
+        "yearly",
+        "hourly",
+        "annually",
+        "quarterly",
+    ]
+    .contains(&token)
 }
 
 fn normalized_tokens(text: &str) -> Vec<String> {

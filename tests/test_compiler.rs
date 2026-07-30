@@ -79,7 +79,12 @@ fn test_modal_word_requires_boundary() {
     let compiler = PolicyCompiler::new();
     let result = compiler.compile("The mayor must be logged by SYSTEM.");
 
-    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Pass,
+        "errors: {:?}",
+        result.errors
+    );
 }
 
 // =============================================================================
@@ -137,7 +142,60 @@ fn test_ordered_actions_with_then_passes() {
     let policy = "Log actions then audit them by SYSTEM.";
     let result = compiler.compile(policy);
 
-    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Pass,
+        "errors: {:?}",
+        result.errors
+    );
+}
+
+#[test]
+fn test_deontic_auxiliary_without_substantive_action_fails() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Policy must exist by SYSTEM.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::MissingActionVerb { .. }
+    ));
+}
+
+#[test]
+fn test_can_is_rejected_as_modal_language() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Actions can be logged by SYSTEM.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        &result.errors[0],
+        CompilationError::ModalLanguageDetected { modal_word, .. } if modal_word == "can"
+    ));
+}
+
+#[test]
+fn test_comma_separated_actions_without_ordering_fail() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Log, audit records by SYSTEM.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::AmbiguousMultiAction { .. }
+    ));
+}
+
+#[test]
+fn test_ordering_word_after_actions_does_not_order_them() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Log and audit records before Friday by SYSTEM.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::AmbiguousMultiAction { .. }
+    ));
 }
 
 // =============================================================================
@@ -169,6 +227,21 @@ fn test_single_clause_compiles() {
     assert_eq!(auth.id, "zt_auth_0");
     assert_eq!(auth.principal, Principal::System);
     assert_eq!(auth.clause_index, 0);
+    assert_eq!(auth.scope, "All actions must be logged by SYSTEM");
+    assert!(auth.delegation_rules.is_empty());
+    assert!(auth.revocation_triggers.is_empty());
+}
+
+#[test]
+fn test_authority_rules_are_only_emitted_when_explicit() {
+    let compiler = PolicyCompiler::new();
+    let policy = "SERVICE must delegate access then revoke it by SERVICE.";
+    let result = compiler.compile(policy);
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    let authority = &result.zt_authority_graph[0];
+    assert_eq!(authority.delegation_rules, vec![authority.scope.clone()]);
+    assert_eq!(authority.revocation_triggers, vec![authority.scope.clone()]);
 }
 
 #[test]
@@ -195,7 +268,7 @@ fn test_multiple_clauses_compiles() {
 #[test]
 fn test_assumptions_and_exclusions_parsed() {
     let compiler = PolicyCompiler::new();
-    let policy = "Assumes network must be secure by SYSTEM. All actions must be logged by SYSTEM. Except for testing must be allowed by USER.";
+    let policy = "Assumes network state must be recorded by SYSTEM. All actions must be logged by SYSTEM. Except for testing must be allowed by USER.";
     let result = compiler.compile(policy);
 
     assert_eq!(result.verdict, CompilationStatus::Pass);
@@ -212,7 +285,8 @@ fn test_assumptions_and_exclusions_parsed() {
 #[test]
 fn test_cost_clause_compiles() {
     let compiler = PolicyCompiler::new();
-    let policy = "All actions must be logged by SYSTEM. Cost of logging cannot exceed 1000 USD per month by SERVICE.";
+    let policy =
+        "All actions must be logged by SYSTEM. Cost of logging cannot exceed 1000 USD by SERVICE.";
     let result = compiler.compile(policy);
 
     assert_eq!(result.verdict, CompilationStatus::Pass);
@@ -222,6 +296,45 @@ fn test_cost_clause_compiles() {
     assert_eq!(cost.id, "icae_1");
     assert_eq!(cost.measurement_unit, MeasurementUnit::Usd);
     assert_eq!(cost.clause_index, 1);
+    assert_eq!(cost.subject, "logging");
+    assert_eq!(cost.ceiling, Some(1000.0));
+    assert!(cost.externalities.is_empty());
+}
+
+#[test]
+fn test_decimal_ceiling_does_not_split_clause() {
+    let compiler = PolicyCompiler::new();
+    let policy =
+        "Cost of inference cannot exceed 0.5 USD by SERVICE. All actions must be logged by SYSTEM.";
+    let result = compiler.compile(policy);
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.intent_normalization.clauses.len(), 2);
+    assert_eq!(result.icae_constraints[0].ceiling, Some(0.5));
+}
+
+#[test]
+fn test_invalid_ceiling_fails_closed() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference cost cannot exceed -1 USD by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::InvalidCeiling { .. }
+    ));
+}
+
+#[test]
+fn test_unrepresentable_rate_window_fails_closed() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference cost cannot exceed 10 USD per hour by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::IntentNormalizationFailed { .. }
+    ));
 }
 
 #[test]
@@ -230,19 +343,55 @@ fn test_cost_with_tokens_unit() {
     let policy = "Token usage of 5000 tokens must be tracked by SERVICE.";
     let result = compiler.compile(policy);
 
-    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Pass,
+        "errors: {:?}",
+        result.errors
+    );
     assert_eq!(result.icae_constraints.len(), 1);
     assert_eq!(
         result.icae_constraints[0].measurement_unit,
         MeasurementUnit::Tokens
+    );
+    assert_eq!(result.icae_constraints[0].subject, "token");
+}
+
+#[test]
+fn test_fee_price_and_charge_are_cost_indicators() {
+    let compiler = PolicyCompiler::new();
+
+    for indicator in ["fee", "price", "charge"] {
+        let policy = format!("Inference {} cannot exceed 1 USD by SERVICE.", indicator);
+        let result = compiler.compile(&policy);
+        assert_eq!(
+            result.verdict,
+            CompilationStatus::Pass,
+            "failed for {}",
+            indicator
+        );
+        assert_eq!(result.icae_constraints.len(), 1);
+        assert_eq!(result.icae_constraints[0].subject, "inference");
+    }
+}
+
+#[test]
+fn test_externalities_are_only_emitted_when_explicit() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference externality must be tracked in USD by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.icae_constraints[0].externalities.len(), 1);
+    assert_eq!(
+        result.icae_constraints[0].externalities[0],
+        "Inference externality must be tracked in USD by SERVICE"
     );
 }
 
 #[test]
 fn test_cost_without_subject_fails() {
     let compiler = PolicyCompiler::new();
-    // All words are stop words or too short - no valid subject
-    let policy = "Cost must be for the by SYSTEM.";
+    let policy = "Cost must be tracked in USD by SYSTEM.";
     let result = compiler.compile(policy);
 
     assert_eq!(result.verdict, CompilationStatus::Fail);
@@ -272,6 +421,58 @@ fn test_missing_principal_fails() {
     ));
 }
 
+#[test]
+fn test_explicit_by_principal_wins_over_object_mention() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("USER activity must be logged by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.zt_authority_graph[0].principal, Principal::Service);
+}
+
+#[test]
+fn test_multiple_explicit_principals_fail() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Data must be logged by SYSTEM and USER.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::AmbiguousPrincipal { .. }
+    ));
+}
+
+#[test]
+fn test_non_governing_principal_mentions_do_not_supply_authority() {
+    let compiler = PolicyCompiler::new();
+    for policy in [
+        "Requests submitted by USER must be denied.",
+        "Requests from USER must be denied.",
+        "USER credentials must be logged.",
+    ] {
+        let result = compiler.compile(policy);
+        assert_eq!(
+            result.verdict,
+            CompilationStatus::Fail,
+            "passed: {}",
+            policy
+        );
+        assert!(matches!(
+            result.errors[0],
+            CompilationError::MissingPrincipal { .. }
+        ));
+    }
+}
+
+#[test]
+fn test_post_action_by_principal_with_optional_article_is_governing() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Requests must be denied by the SYSTEM.");
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.zt_authority_graph[0].principal, Principal::System);
+}
+
 // =============================================================================
 // Cost Validation Tests
 // =============================================================================
@@ -279,7 +480,8 @@ fn test_missing_principal_fails() {
 #[test]
 fn test_cost_mention_without_explicit_unit_fails() {
     let compiler = PolicyCompiler::new();
-    let policy = "All actions must be logged by SYSTEM. Cost of logging cannot exceed $1000 per month by SERVICE.";
+    let policy =
+        "All actions must be logged by SYSTEM. Cost of logging cannot exceed $1000 by SERVICE.";
     let result = compiler.compile(policy);
 
     assert_eq!(result.verdict, CompilationStatus::Fail);
@@ -295,7 +497,8 @@ fn test_cost_mention_without_explicit_unit_fails() {
 #[test]
 fn test_cost_mention_with_explicit_unit_passes() {
     let compiler = PolicyCompiler::new();
-    let policy = "All actions must be logged by SYSTEM. Cost of logging cannot exceed 1000 USD per month by SERVICE.";
+    let policy =
+        "All actions must be logged by SYSTEM. Cost of logging cannot exceed 1000 USD by SERVICE.";
     let result = compiler.compile(policy);
 
     assert_eq!(result.verdict, CompilationStatus::Pass);
@@ -313,6 +516,126 @@ fn test_measurement_unit_requires_boundary() {
         &result.errors[0],
         CompilationError::MissingMeasurementUnit { .. }
     ));
+}
+
+#[test]
+fn test_multiple_distinct_measurement_units_fail() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference cost cannot exceed 100 USD/EUR by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::AmbiguousMeasurementUnit { .. }
+    ));
+}
+
+#[test]
+fn test_positive_exceed_floor_fails_closed() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference cost must exceed 100 USD by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::InvalidCeiling { .. }
+    ));
+}
+
+#[test]
+fn test_explicit_limit_populates_ceiling() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference cost limit of 100 USD must be enforced by SERVICE.");
+
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Pass,
+        "errors: {:?}",
+        result.errors
+    );
+    assert_eq!(result.icae_constraints[0].ceiling, Some(100.0));
+}
+
+#[test]
+fn test_plural_cost_indicator_cannot_bypass_icae() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference costs cannot exceed 10 USD by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.icae_constraints.len(), 1);
+    assert_eq!(result.icae_constraints[0].subject, "inference");
+}
+
+#[test]
+fn test_multiword_cost_subjects_are_preserved() {
+    let compiler = PolicyCompiler::new();
+
+    let result = compiler.compile("Cost of model inference cannot exceed 10 USD by SERVICE.");
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.icae_constraints[0].subject, "model inference");
+
+    let result = compiler.compile("API request fee cannot exceed 1 USD by SERVICE.");
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.icae_constraints[0].subject, "api request");
+}
+
+#[test]
+fn test_distinct_cost_subjects_in_one_clause_fail() {
+    let compiler = PolicyCompiler::new();
+    let result =
+        compiler.compile("Inference cost and storage cost must be tracked in USD by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::AmbiguousCostSubject { .. }
+    ));
+}
+
+#[test]
+fn test_external_cost_is_one_indicator_span() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Inference external cost must be tracked in USD by SERVICE.");
+
+    assert_eq!(result.verdict, CompilationStatus::Pass);
+    assert_eq!(result.icae_constraints[0].subject, "inference");
+    assert_eq!(result.icae_constraints[0].externalities.len(), 1);
+}
+
+#[test]
+fn test_implicit_rate_windows_fail_closed() {
+    let compiler = PolicyCompiler::new();
+    for policy in [
+        "Inference cost cannot exceed 10 USD monthly by SERVICE.",
+        "Inference cost cannot exceed 10 USD every month by SERVICE.",
+        "Daily inference cost must be tracked in USD by SERVICE.",
+    ] {
+        let result = compiler.compile(policy);
+        assert_eq!(
+            result.verdict,
+            CompilationStatus::Fail,
+            "passed: {}",
+            policy
+        );
+        assert!(matches!(
+            result.errors[0],
+            CompilationError::IntentNormalizationFailed { .. }
+        ));
+    }
+}
+
+#[test]
+fn test_clause_leading_participle_is_not_an_action() {
+    let compiler = PolicyCompiler::new();
+    let result = compiler.compile("Logged data must exist by SYSTEM.");
+    assert_eq!(result.verdict, CompilationStatus::Fail);
+    assert!(matches!(
+        result.errors[0],
+        CompilationError::MissingActionVerb { .. }
+    ));
+
+    let passive = compiler.compile("Data must be logged by SYSTEM.");
+    assert_eq!(passive.verdict, CompilationStatus::Pass);
 }
 
 // =============================================================================
@@ -422,7 +745,7 @@ fn test_compiler_clone_independence() {
 fn test_deterministic_output() {
     let compiler = PolicyCompiler::new();
     let policy =
-        "All actions must be logged by SYSTEM. Cost tracking requires 100 USD budget by SERVICE.";
+        "All actions must be logged by SYSTEM. Inference cost must be tracked in USD by SERVICE.";
 
     let result1 = compiler.compile(policy);
     let result2 = compiler.compile(policy);
@@ -510,31 +833,31 @@ fn test_all_measurement_units() {
 
     let test_cases = vec![
         (
-            "Cost must be tracked in USD by SYSTEM.",
+            "Inference cost must be tracked in USD by SYSTEM.",
             MeasurementUnit::Usd,
         ),
         (
-            "Cost must be tracked in EUR by SYSTEM.",
+            "Storage cost must be tracked in EUR by SYSTEM.",
             MeasurementUnit::Eur,
         ),
         (
-            "Cost must be tracked in GBP by SYSTEM.",
+            "Compute cost must be tracked in GBP by SYSTEM.",
             MeasurementUnit::Gbp,
         ),
         (
-            "Usage must be tracked in tokens by SYSTEM.",
+            "Model usage must be tracked in tokens by SYSTEM.",
             MeasurementUnit::Tokens,
         ),
         (
-            "Usage must be tracked in bytes by SYSTEM.",
+            "Payload usage must be tracked in bytes by SYSTEM.",
             MeasurementUnit::Bytes,
         ),
         (
-            "Usage must be tracked in requests by SYSTEM.",
+            "API usage must be tracked in requests by SYSTEM.",
             MeasurementUnit::Requests,
         ),
         (
-            "Usage must be tracked in hours by SYSTEM.",
+            "Compute usage must be tracked in hours by SYSTEM.",
             MeasurementUnit::Hours,
         ),
     ];
