@@ -625,6 +625,116 @@ fn test_implicit_rate_windows_fail_closed() {
 }
 
 #[test]
+fn test_article_and_slash_rate_windows_fail_closed() {
+    let compiler = PolicyCompiler::new();
+    for policy in [
+        "Inference cost cannot exceed 10 USD a month by SERVICE.",
+        "Inference cost cannot exceed 10 USD an hour by SERVICE.",
+        "Inference cost cannot exceed 10 USD/month by SERVICE.",
+        "API usage cannot exceed 100 requests/hour by SERVICE.",
+    ] {
+        let result = compiler.compile(policy);
+        assert_eq!(
+            result.verdict,
+            CompilationStatus::Fail,
+            "passed: {}",
+            policy
+        );
+        assert!(
+            matches!(
+                result.errors[0],
+                CompilationError::IntentNormalizationFailed { .. }
+            ),
+            "unexpected error for {}: {:?}",
+            policy,
+            result.errors
+        );
+    }
+}
+
+#[test]
+fn test_ceiling_literal_must_equal_the_written_number() {
+    let compiler = PolicyCompiler::new();
+
+    for policy in [
+        // A decimal comma is not a digit-group separator.
+        "Inference cost cannot exceed 0,5 EUR by SERVICE.",
+        "Inference cost cannot exceed 1,50 EUR by SERVICE.",
+        "Inference cost cannot exceed 1.000,50 EUR by SERVICE.",
+        // Magnitude suffixes and words scale the literal.
+        "Inference cost cannot exceed 5k USD by SERVICE.",
+        "Token usage cannot exceed 2M tokens by SERVICE.",
+        "Inference cost cannot exceed 5 million USD by SERVICE.",
+        "Inference cost cannot exceed 10 000 USD by SERVICE.",
+    ] {
+        let result = compiler.compile(policy);
+        assert_eq!(
+            result.verdict,
+            CompilationStatus::Fail,
+            "passed: {}",
+            policy
+        );
+        assert!(
+            matches!(result.errors[0], CompilationError::InvalidCeiling { .. }),
+            "unexpected error for {}: {:?}",
+            policy,
+            result.errors
+        );
+    }
+
+    for (policy, expected) in [
+        ("Inference cost cannot exceed 1,000 USD by SERVICE.", 1000.0),
+        (
+            "Inference cost cannot exceed 1,234,567.5 USD by SERVICE.",
+            1234567.5,
+        ),
+        ("Inference cost cannot exceed 1e3 USD by SERVICE.", 1000.0),
+    ] {
+        let result = compiler.compile(policy);
+        assert_eq!(
+            result.verdict,
+            CompilationStatus::Pass,
+            "errors for {}: {:?}",
+            policy,
+            result.errors
+        );
+        assert_eq!(result.icae_constraints[0].ceiling, Some(expected));
+    }
+}
+
+#[test]
+fn test_hyphenated_ceiling_keyword_requires_and_keeps_its_bound() {
+    let compiler = PolicyCompiler::new();
+
+    let result = compiler.compile("Rate-limit of 100 requests must be enforced by SERVICE.");
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Pass,
+        "errors: {:?}",
+        result.errors
+    );
+    assert_eq!(result.icae_constraints[0].ceiling, Some(100.0));
+
+    // The unhyphenated form already fails without a numeric bound.
+    for policy in [
+        "Inference cost cap must be enforced in USD by SERVICE.",
+        "Inference cost-cap must be enforced in USD by SERVICE.",
+    ] {
+        let result = compiler.compile(policy);
+        assert_eq!(
+            result.verdict,
+            CompilationStatus::Fail,
+            "passed: {}",
+            policy
+        );
+        assert!(matches!(
+            result.errors[0],
+            CompilationError::InvalidCeiling { .. }
+        ));
+    }
+}
+
+#[test]
 fn test_clause_leading_participle_is_not_an_action() {
     let compiler = PolicyCompiler::new();
     let result = compiler.compile("Logged data must exist by SYSTEM.");

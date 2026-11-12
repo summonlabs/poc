@@ -867,10 +867,15 @@ impl PolicyCompiler {
     /// floor, not a ceiling, and is rejected rather than silently mistranslated.
     fn extract_ceiling(clause: &str) -> Result<Option<f64>, String> {
         let words: Vec<&str> = clause.split_whitespace().collect();
+        // Match on each word's final alphanumeric segment so a compound such as
+        // `rate-limit` is recognized exactly as the cost-indicator tokenizer
+        // sees it, instead of compiling without the bound it states.
         let normalized_words: Vec<String> = words
             .iter()
             .map(|word| {
-                word.trim_matches(|character: char| !character.is_alphanumeric())
+                word.rsplit(|character: char| !character.is_alphanumeric())
+                    .find(|segment| !segment.is_empty())
+                    .unwrap_or("")
                     .to_lowercase()
             })
             .collect();
@@ -883,7 +888,7 @@ impl PolicyCompiler {
                 if !negative {
                     return Err("unsupported floor: exceed".to_string());
                 }
-                return Self::parse_ceiling_value(words.get(index + 1).copied());
+                return Self::parse_ceiling_at(&words, &normalized_words, index + 1);
             }
 
             let relation_offset = match normalized.as_str() {
@@ -900,26 +905,45 @@ impl PolicyCompiler {
                 } else {
                     relation_index
                 };
-                return Self::parse_ceiling_value(words.get(value_index).copied());
+                return Self::parse_ceiling_at(&words, &normalized_words, value_index);
             }
         }
 
         Ok(None)
     }
 
+    /// Parses the ceiling literal at `value_index`. A literal that continues in
+    /// the following word (`5 million`, `10 000`) is rejected, because its first
+    /// word alone is a different number than the one written.
+    fn parse_ceiling_at(
+        words: &[&str],
+        normalized_words: &[String],
+        value_index: usize,
+    ) -> Result<Option<f64>, String> {
+        let ceiling = Self::parse_ceiling_value(words.get(value_index).copied())?;
+        if let Some(next) = normalized_words.get(value_index + 1) {
+            if next.starts_with(|character: char| character.is_ascii_digit())
+                || ["hundred", "thousand", "million", "billion", "trillion"]
+                    .contains(&next.as_str())
+            {
+                return Err(format!("{} {}", words[value_index], words[value_index + 1]));
+            }
+        }
+        Ok(ceiling)
+    }
+
     fn parse_ceiling_value(raw_value: Option<&str>) -> Result<Option<f64>, String> {
         let raw_value = raw_value.ok_or_else(|| "<missing>".to_string())?;
-        let numeric_text = raw_value
-            .trim_matches(|character: char| {
-                !(character.is_ascii_digit()
-                    || character == '.'
-                    || character == '+'
-                    || character == '-'
-                    || character == 'e'
-                    || character == 'E'
-                    || character == ',')
-            })
-            .replace(',', "");
+        // Strip surrounding punctuation only. Letters attached to the number
+        // (`5k`, `2M`) scale it and must not be discarded.
+        let literal = raw_value.trim_matches(|character: char| {
+            !(character.is_alphanumeric()
+                || character == '.'
+                || character == '+'
+                || character == '-')
+        });
+        let numeric_text =
+            Self::strip_digit_group_separators(literal).ok_or_else(|| raw_value.to_string())?;
 
         let value = numeric_text
             .parse::<f64>()
@@ -928,6 +952,43 @@ impl PolicyCompiler {
             return Err(raw_value.to_string());
         }
         Ok(Some(value))
+    }
+
+    /// Removes digit-group separators from a numeric literal. Returns `None`
+    /// when a comma cannot be a group separator (for example the decimal comma
+    /// in `0,5`), because dropping it would silently change the value.
+    fn strip_digit_group_separators(literal: &str) -> Option<String> {
+        if !literal.contains(',') {
+            return Some(literal.to_string());
+        }
+
+        // Separators are only meaningful in the integer part of the mantissa.
+        let integer_end = literal
+            .find(|character: char| matches!(character, '.' | 'e' | 'E'))
+            .unwrap_or(literal.len());
+        let (integer, remainder) = literal.split_at(integer_end);
+        if remainder.contains(',') {
+            return None;
+        }
+        let digits = integer.trim_start_matches(|character: char| matches!(character, '+' | '-'));
+        let sign = &integer[..integer.len() - digits.len()];
+
+        let groups: Vec<&str> = digits.split(',').collect();
+        let last = groups.len() - 1;
+        for (index, group) in groups.iter().enumerate() {
+            let valid_length = if index == 0 {
+                (1..=3).contains(&group.len()) && !group.starts_with('0')
+            } else if index == last {
+                group.len() == 3
+            } else {
+                group.len() == 2 || group.len() == 3
+            };
+            if !valid_length || !group.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+        }
+
+        Some(format!("{}{}{}", sign, groups.concat(), remainder))
     }
 
     /// Builds traceability map linking clauses to artifacts.
@@ -1173,7 +1234,11 @@ fn extract_rate_window(clause: &str) -> Option<String> {
         if pair[0] == "per" {
             return Some(format!("per {}", pair[1]));
         }
-        if ["each", "every"].contains(&pair[0].as_str())
+        // `10 USD a month` and `10 USD/month` state the same rate window as
+        // `10 USD every month`.
+        if (["each", "every", "a", "an"].contains(&pair[0].as_str())
+            || ["usd", "eur", "gbp", "tokens", "bytes", "requests", "hours"]
+                .contains(&pair[0].as_str()))
             && [
                 "hour", "hours", "day", "days", "week", "weeks", "month", "months", "year",
                 "years", "quarter", "quarters",
