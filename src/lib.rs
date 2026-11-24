@@ -879,6 +879,11 @@ impl PolicyCompiler {
                     .to_lowercase()
             })
             .collect();
+        // A stated minimum is a floor. Compiling its number as a ceiling would
+        // invert the bound.
+        let states_minimum = normalized_words
+            .iter()
+            .any(|word| word == "minimum" || word == "minimums");
 
         for (index, normalized) in normalized_words.iter().enumerate() {
             if normalized == "exceed" {
@@ -887,6 +892,9 @@ impl PolicyCompiler {
                     .any(|word| word == "cannot" || word == "not");
                 if !negative {
                     return Err("unsupported floor: exceed".to_string());
+                }
+                if states_minimum {
+                    return Err("unsupported floor: minimum".to_string());
                 }
                 return Self::parse_ceiling_at(&words, &normalized_words, index + 1);
             }
@@ -905,7 +913,32 @@ impl PolicyCompiler {
                 } else {
                     relation_index
                 };
+                if states_minimum {
+                    return Err("unsupported floor: minimum".to_string());
+                }
                 return Self::parse_ceiling_at(&words, &normalized_words, value_index);
+            }
+        }
+
+        // A quantity bounded by a comparative the compiler does not translate
+        // (`less than 100`, `at most 100`, `above 100`) must not compile as a
+        // constraint without the bound the clause states.
+        for (index, normalized) in normalized_words.iter().enumerate() {
+            let previous = index
+                .checked_sub(1)
+                .map(|previous| normalized_words[previous].as_str());
+            let comparative = matches!(
+                normalized.as_str(),
+                "than" | "below" | "under" | "above" | "over"
+            ) || (matches!(normalized.as_str(), "most" | "least")
+                && previous == Some("at"))
+                || (normalized == "to" && previous == Some("up"));
+            if comparative && Self::parse_ceiling_value(words.get(index + 1).copied()).is_ok() {
+                return Err(format!(
+                    "unsupported bound: {} {}",
+                    words[index],
+                    words[index + 1]
+                ));
             }
         }
 
@@ -929,11 +962,36 @@ impl PolicyCompiler {
                 return Err(format!("{} {}", words[value_index], words[value_index + 1]));
             }
         }
+
+        // A range or an alternative (`100 to 200 USD`, `100 USD or 200 USD`)
+        // states more than the first number.
+        let mut connector_index = value_index + 1;
+        if normalized_words.get(connector_index).is_some_and(|word| {
+            ["usd", "eur", "gbp", "tokens", "bytes", "requests", "hours"].contains(&word.as_str())
+        }) {
+            connector_index += 1;
+        }
+        if normalized_words
+            .get(connector_index)
+            .is_some_and(|word| ["to", "or", "and", "nor"].contains(&word.as_str()))
+            && Self::parse_ceiling_value(words.get(connector_index + 1).copied()).is_ok()
+        {
+            return Err(format!(
+                "{} {} {}",
+                words[value_index],
+                words[connector_index],
+                words[connector_index + 1]
+            ));
+        }
         Ok(ceiling)
     }
 
     fn parse_ceiling_value(raw_value: Option<&str>) -> Result<Option<f64>, String> {
         let raw_value = raw_value.ok_or_else(|| "<missing>".to_string())?;
+        // A percentage is a share of some other quantity, not this number.
+        if raw_value.contains('%') {
+            return Err(raw_value.to_string());
+        }
         // Strip surrounding punctuation only. Letters attached to the number
         // (`5k`, `2M`) scale it and must not be discarded.
         let literal = raw_value.trim_matches(|character: char| {
@@ -1223,6 +1281,7 @@ fn extract_rate_window(clause: &str) -> Option<String> {
             "yearly",
             "hourly",
             "annually",
+            "annual",
             "quarterly",
         ]
         .contains(&token.as_str())
@@ -1246,6 +1305,19 @@ fn extract_rate_window(clause: &str) -> Option<String> {
             .contains(&pair[1].as_str())
         {
             return Some(format!("{} {}", pair[0], pair[1]));
+        }
+    }
+    // A calendar period anywhere in a cost clause scopes the cost in time
+    // (`every 30 days`, `within 7 days`, `this month`, `during the year`).
+    // `hours` is excluded here because it is also a measurement unit.
+    for token in &tokens {
+        if [
+            "hour", "day", "days", "week", "weeks", "month", "months", "year", "years", "quarter",
+            "quarters",
+        ]
+        .contains(&token.as_str())
+        {
+            return Some(token.clone());
         }
     }
     None

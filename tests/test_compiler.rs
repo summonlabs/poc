@@ -734,6 +734,87 @@ fn test_hyphenated_ceiling_keyword_requires_and_keeps_its_bound() {
     }
 }
 
+fn assert_compile_fails(policy: &str) -> CompilationError {
+    let result = PolicyCompiler::new().compile(policy);
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Fail,
+        "passed: {} -> {:?}",
+        policy,
+        result.icae_constraints
+    );
+    result.errors[0].clone()
+}
+
+#[test]
+fn test_counted_and_scoped_rate_windows_fail_closed() {
+    for policy in [
+        "Inference cost cannot exceed 10 USD every 30 days by SERVICE.",
+        "Inference cost cannot exceed 10 USD in 30 days by SERVICE.",
+        "Inference cost cannot exceed 10 USD within 7 days by SERVICE.",
+        "Inference cost cannot exceed 10 USD every two weeks by SERVICE.",
+        "Inference cost cannot exceed 10 USD in any 24 hour period by SERVICE.",
+        "Inference cost cannot exceed 1000 USD this month by SERVICE.",
+        "Inference cost cannot exceed 1000 USD during the year by SERVICE.",
+        "Annual inference cost cannot exceed 1000 USD by SERVICE.",
+    ] {
+        let error = assert_compile_fails(policy);
+        assert!(
+            matches!(error, CompilationError::IntentNormalizationFailed { .. }),
+            "unexpected error for {}: {:?}",
+            policy,
+            error
+        );
+    }
+
+    // `hours` stays a measurement unit when it is the bounded quantity.
+    let result = PolicyCompiler::new().compile("Compute usage cannot exceed 100 hours by SERVICE.");
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Pass,
+        "errors: {:?}",
+        result.errors
+    );
+    assert_eq!(result.icae_constraints[0].ceiling, Some(100.0));
+}
+
+#[test]
+fn test_bounds_the_artifact_cannot_state_fail_closed() {
+    for policy in [
+        // A minimum is a floor, not a ceiling.
+        "A minimum inference budget of 100 USD must be enforced by SERVICE.",
+        // A range, an alternative or a percentage is not the first number alone.
+        "Inference cost must not exceed 100 to 200 USD by SERVICE.",
+        "Inference cost cannot exceed 100 USD or 200 USD by SERVICE.",
+        "Token usage cannot exceed 80% tokens by SERVICE.",
+        // A comparative bound must not compile as "no ceiling".
+        "Inference cost below 100 USD must be enforced by SERVICE.",
+        "Inference cost above 100 USD must be denied by SERVICE.",
+        "Inference cost of less than 100 USD must be enforced by SERVICE.",
+        "Inference cost of at most 100 USD must be enforced by SERVICE.",
+        "Inference cost of up to 100 USD must be enforced by SERVICE.",
+    ] {
+        let error = assert_compile_fails(policy);
+        assert!(
+            matches!(error, CompilationError::InvalidCeiling { .. }),
+            "unexpected error for {}: {:?}",
+            policy,
+            error
+        );
+    }
+
+    // Comparative words without a quantity are ordinary prose.
+    let result = PolicyCompiler::new()
+        .compile("Inference cost under review must be tracked in USD by SERVICE.");
+    assert_eq!(
+        result.verdict,
+        CompilationStatus::Pass,
+        "errors: {:?}",
+        result.errors
+    );
+    assert_eq!(result.icae_constraints[0].ceiling, None);
+}
+
 #[test]
 fn test_clause_leading_participle_is_not_an_action() {
     let compiler = PolicyCompiler::new();
